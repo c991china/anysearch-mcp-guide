@@ -1,22 +1,93 @@
-"""AnySearch MCP 的 Python 调用示例（概念代码，需配合真实 SDK）。"""
+"""Minimal MCP client that talks to the AnySearch server over stdio.
 
+Run:
+    pip install "mcp>=1.2,<2"
+    export ANYSEARCH_API_KEY=YOUR_ANYSEARCH_KEY
+    python examples/python/sdk_usage.py "what is the streamable http transport"
+
+The API key is read from the environment on purpose. If you hardcode it and
+commit the file, that's on you.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
 import os
+import sys
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+SERVER_CMD = os.environ.get("ANYSEARCH_MCP_CMD", "anysearch-mcp")
 
 
-def search(query: str, max_results: int = 5):
-    """调用 AnySearch 做一次搜索。
+def _server_params() -> StdioServerParameters:
+    key = os.environ.get("ANYSEARCH_API_KEY")
+    if not key:
+        sys.exit("ANYSEARCH_API_KEY is not set. export it first.")
+    return StdioServerParameters(
+        command=SERVER_CMD,
+        args=["--transport", "stdio"],
+        # The client does NOT inherit your shell env. Pass it explicitly.
+        env={"ANYSEARCH_API_KEY": key},
+    )
 
-    实际使用时替换为官方 SDK 的调用方式；此处展示入参与返回结构。
+
+def _first_text(result) -> str:
+    """Pull the text out of a CallToolResult.
+
+    Tools return content as a list of blocks. We only care about the first
+    text block; if a tool ever returns an image this would need a check.
     """
-    api_key = os.environ.get("ANYSEARCH_API_KEY")
-    if not api_key:
-        raise RuntimeError("缺少 ANYSEARCH_API_KEY 环境变量")
-    # 伪代码：真实 SDK 类似 mcp_client.call("search", query=query, top_k=max_results)
-    payload = {"query": query, "top_k": max_results}
-    print(f"[mock] search({payload}) with key=***{api_key[-4:]}")
-    return [{"title": f"result-{i}", "score": 1 - i * 0.1} for i in range(max_results)]
+    for block in result.content:
+        if getattr(block, "type", None) == "text":
+            return block.text
+    return ""
+
+
+async def run(query: str, max_results: int = 3) -> int:
+    async with stdio_client(_server_params()) as (read, write):
+        async with ClientSession(read, write) as session:
+            init = await session.initialize()
+            print(f"connected to {init.serverInfo.name} {init.serverInfo.version}")
+
+            listed = await session.list_tools()
+            names = sorted(t.name for t in listed.tools)
+            print(f"tools: {names}")
+
+            if "search" not in names:
+                print("server has no 'search' tool; nothing to do", file=sys.stderr)
+                return 2
+
+            result = await session.call_tool(
+                "search", {"query": query, "max_results": max_results}
+            )
+
+            if result.isError:
+                # Tool-level failure: auth, rate limit, upstream. Not a crash.
+                print(f"search failed: {_first_text(result)}", file=sys.stderr)
+                return 1
+
+            payload = json.loads(_first_text(result))
+            hits = payload.get("results", [])
+            print(f"{len(hits)} result(s) of ~{payload.get('total_results', '?')}")
+
+            for i, hit in enumerate(hits, 1):
+                title = hit.get("title") or "(no title)"
+                print(f"{i}. {title}")
+                print(f"   {hit.get('url', '')}")
+                snippet = (hit.get("snippet") or "").strip()
+                if snippet:
+                    # Collapse newlines so one result stays on one visual line.
+                    print(f"   {' '.join(snippet.split())[:160]}")
+    return 0
+
+
+def main() -> None:
+    query = " ".join(sys.argv[1:]) or "model context protocol transports"
+    raise SystemExit(asyncio.run(run(query)))
 
 
 if __name__ == "__main__":
-    for item in search("GitHub API 用法", max_results=3):
-        print(item)
+    main()
